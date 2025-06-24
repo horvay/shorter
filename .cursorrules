@@ -1,0 +1,22 @@
+## Project Overview
+This is a project used to download videos from youtube and then create shorts or clips from the video. It'll have the ability to create either a short format or a normal video format.
+
+Features:
+- Download a video from youtube given a URL
+- The ability to select a start and end section of the video with a preview of what is being selected
+- The ability to remove sections of the video automatically where there is up to 1 second of silence.
+- Once narrowed down, the ability to select small chunks and remove them
+
+## Code Style and Standards
+- Prefer functional over OOP
+- Should use Python
+- Should provide types where possible
+
+## Documentation Requirements
+- All video manipulation should use ffmpeg - assume it exists in the path
+- Moviepy should NOT be used, as it is very slow
+- When creating a vertical short from a normal video, it should put the video 1/3rd up the vertical video
+- Each step should have it's own tab or screen (download, select a section of video and cutting out the rest, remove quiet sections over 1 second, ability to remove chunks)
+
+## Environment and Configuration
+- Should work on both Linux and Windows
