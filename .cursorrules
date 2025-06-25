@@ -8,7 +8,7 @@ Features:
 - Once narrowed down, the ability to select small chunks and remove them
 
 ## Code Style and Standards
-- Prefer functional over OOP
+- Prefer functional over OOP and classes
 - Should use Python
 - Should provide types where possible
 
