@@ -7,7 +7,6 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QRect, QRectF, QSizeF
 from shorter.ui.widgets.zoom_video_widget import ZoomVideoWidget
 from shorter.core.video_utils import process_zoom_pan, get_video_resolution
-import time
 
 VIDEO_DIR = "videos"
 CUTS_DIR = os.path.join(VIDEO_DIR, "cuts")

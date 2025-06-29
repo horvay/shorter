@@ -8,4 +8,6 @@ dependencies = [
     "pyside6>=6.9.1",
     "superqt>=0.7.5",
     "yt-dlp>=2025.6.9",
+    "torch>=2.7.1",
+    "nemo_toolkit[asr]>=2.3.1",
 ]

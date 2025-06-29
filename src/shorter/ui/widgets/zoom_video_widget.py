@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-from PySide6.QtGui import QPen, QBrush, QColor, QPainter
+from PySide6.QtGui import QPen, QColor, QPainter
 from PySide6.QtCore import Qt, QRectF, Signal, QPointF
 
 class ZoomVideoWidget(QGraphicsView):
