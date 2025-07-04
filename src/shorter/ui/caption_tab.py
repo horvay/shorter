@@ -1,469 +1,411 @@
 import os
 import subprocess
 import tempfile
+import json
+from typing import List, Dict, Tuple, Any
+
 import nemo.collections.asr as nemo_asr
+from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QComboBox,
     QTableWidget,
-    QProgressBar,
     QTableWidgetItem,
+    QProgressBar,
+    QMessageBox,
     QHeaderView,
-    QApplication,
 )
-from PySide6.QtCore import QThread, Signal, Qt
-from matplotlib.font_manager import findSystemFonts
-from matplotlib.textpath import TextPath
-from matplotlib.font_manager import FontProperties
 from PIL import ImageFont
-import random
-import re
-import platform
-import traceback
 
+# Directory that holds cuts to be captioned
+CLIPS_DIR = os.path.join("videos", "cuts")
+# Directory that holds bundled fonts
+FONTS_DIR = "fonts"
+# Output directory for captioned videos
+OUTPUT_DIR = os.path.join(CLIPS_DIR, "captioned")
+
+# Words that should not start a new, enlarged caption line
+AVOID_LIST = {
+    # articles / determiners
+    "a", "an", "the", "this", "that", "these", "those",
+
+    # pronouns
+    "i", "me", "you", "your", "he", "him", "his", "she", "her", "it", "its", "we", "us", "our", "they", "them", "their",
+
+    # auxiliary / modal verbs
+    "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+
+    # conjunctions / prepositions / misc fillers
+    "and", "or", "but", "so", "for", "nor", "yet", "if", "than", "as", "at", "by", "from", "in", "into", "of", "on", "off",
+    "out", "over", "to", "up", "down", "with", "about", "above", "after", "before", "between", "during", "until", "within",
+
+    # other very common words
+    "not", "no", "yes", "more", "most", "some", "any", "each", "every", "one", "all", "how", "when", "where", "what",
+    "which", "who", "whom", "why", "been", "there", "here", "then", "too", "very",
+
+    # common contractions
+    "i'm", "you're", "we're", "they're", "it's", "that's", "there's", "who's",
+    "i've", "you've", "we've", "they've", "could've", "would've", "should've",
+    "i'll", "you'll", "he'll", "she'll", "we'll", "they'll",
+    "isn't", "aren't", "wasn't", "weren't",
+    "don't", "doesn't", "didn't",
+    "can't", "couldn't", "won't", "wouldn't", "shouldn't",
+    "haven't", "hasn't", "hadn't",
+}
+
+# -------------------------------------------------
+# Helper functions
+# -------------------------------------------------
+
+def _ensure_directories() -> None:
+    """Make sure expected folders exist."""
+    for d in (CLIPS_DIR, OUTPUT_DIR):
+        if not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
+
+def _get_video_info(path: str) -> Dict[str, float]:
+    """Return width, height and duration (seconds) for the given video."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration",
+        "-of", "json",
+        path,
+    ]
+    res = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    info = json.loads(res.stdout)["streams"][0]
+    return {
+        "width": int(info["width"]),
+        "height": int(info["height"]),
+        "duration": float(info.get("duration", 0)),
+    }
+
+
+def _font_candidates() -> List[str]:
+    """Return paths to *.ttf / *.otf fonts from FONTS_DIR. Fall back to system fonts if none found."""
+    fonts = []
+    if os.path.isdir(FONTS_DIR):
+        fonts = [os.path.join(FONTS_DIR, f) for f in os.listdir(FONTS_DIR) if f.lower().endswith((".ttf", ".otf"))]
+    if not fonts:
+        # fallback: try to find any system fonts via matplotlib (which is already a dependency elsewhere)
+        from matplotlib.font_manager import findSystemFonts
+        fonts = findSystemFonts(fontpaths=None, fontext='ttf')
+    return fonts
+
+
+def _choose_font(size_key: str, video_height: int) -> int:
+    """Return pixel size for the given key ('small', 'medium', 'large')."""
+    # Sizes are proportional to the video height
+    sizes = {
+        "small": 0.035,   # smaller for less emphasis
+        "medium": 0.055,
+        "large": 0.100,   # even larger for stronger emphasis
+    }
+    return int(video_height * sizes[size_key])
+
+
+# -------------------------------------------------
+# Worker threads
+# -------------------------------------------------
 
 class TranscriptionThread(QThread):
-    finished_signal = Signal(list)
-    error_signal = Signal(str)
+    finished = Signal(list)
+    error = Signal(str)
 
-    def __init__(self, video_path, asr_model):
+    def __init__(self, video_path: str):
         super().__init__()
         self.video_path = video_path
-        self.asr_model = asr_model
+        # Lazy-load ASR model so we do it only once for the whole application
+        global _NEMO_MODEL
+        if "_NEMO_MODEL" not in globals():
+            _NEMO_MODEL = None  # type: ignore
+        self._model: Any = _NEMO_MODEL
 
     def run(self):
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
-                audio_filename = tmp_audio.name
+            if self._model is None:
+                # This model is relatively small (~120 MB) compared to others and decent quality
+                self._model = nemo_asr.models.EncDecCTCModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
+                globals()["_NEMO_MODEL"] = self._model  # cache for next time
 
-            command = [
-                "ffmpeg",
-                "-i",
-                self.video_path,
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                audio_filename,
-                "-y",
+            # Extract mono 16 kHz wav to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+            ff_cmd = [
+                "ffmpeg", "-y", "-i", self.video_path, "-vn",
+                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav_path,
             ]
-            subprocess.run(
-                command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.run(ff_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            output = self.asr_model.transcribe([audio_filename], timestamps=True)
-            word_timestamps = output[0].timestamp["word"]
+            asr_out = self._model.transcribe([wav_path], timestamps=True)  # type: ignore[attr-defined]
+            word_ts = asr_out[0].timestamp["word"]  # list of Dict(word,start_time/offset,...)
 
-            self.finished_signal.emit(word_timestamps)
+            # Normalize timestamps to seconds – newer NeMo returns offsets (frames)
+            win_stride = float(getattr(self._model.cfg.preprocessor, "window_stride", 0.02))  # seconds
+            sec_per_frame = 8 * win_stride  # 8x subsampling for conformer-like models
 
+            for w in word_ts:
+                if "start_time" not in w and "start_offset" in w:
+                    w["start_time"] = float(w["start_offset"]) * sec_per_frame
+                if "end_time" not in w and "end_offset" in w:
+                    w["end_time"]   = float(w["end_offset"])   * sec_per_frame
+
+            self.finished.emit(word_ts)
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error.emit(str(e))
         finally:
-            if os.path.exists(audio_filename):
-                os.remove(audio_filename)
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
 
 
 class CaptioningThread(QThread):
-    finished_signal = Signal(str)
-    error_signal = Signal(str)
+    finished = Signal(bool, str)  # success, message
 
-    def __init__(self, video_path, font_path, transcription):
+    def __init__(self, video_path: str, words: List[Dict], font_path: str, output_path: str):
         super().__init__()
         self.video_path = video_path
+        self.words = words
         self.font_path = font_path
-        self.transcription = transcription
+        self.output_path = output_path
 
-    def get_text_dimensions(self, text, font_path, font_size):
-        try:
-            # Use PIL for more reliable text measurement
-            font = ImageFont.truetype(font_path, font_size)
-            bbox = font.getbbox(text)
-            width = bbox[2] - bbox[0]  # right - left
-            height = bbox[3] - bbox[1]  # bottom - top
-            return width, height
-        except Exception as e:
-            print(f"[Debug] get_text_dimensions failed: {e}")
-            # Fallback to approximate measurement
-            return len(text) * font_size * 0.6, font_size
+    # ---------------- Private helpers ----------------
+    @staticmethod
+    def _word_fontsize(word: str, video_height: int) -> Tuple[int, str]:
+        """Return fontsize and size-key for a word based on rules."""
+        # Decide size category: if the word is common, go smaller, else bigger.
+        if word.lower() in AVOID_LIST:
+            key = "small"
+        elif len(word) > 6:
+            key = "large"
+        else:
+            key = "medium"
+        return _choose_font(key, video_height), key
 
+    # --------------------------------------------------
     def run(self):
         try:
-            print("[Debug] CaptioningThread: Starting run method.")
-            # 1. Get video info
-            print("[Debug] CaptioningThread: Getting video info...")
-            video_info = self.get_video_info()
-            video_duration = self.get_video_duration()
-            video_width = video_info["width"]
-            video_height = video_info["height"]
-            print(f"[Debug] CaptioningThread: Video info: {video_width}x{video_height}, duration: {video_duration}s")
+            _ensure_directories()
+            info = _get_video_info(self.video_path)
+            width, height = int(info["width"]), int(info["height"])
 
-            # 2. Prepare layout
-            print("[Debug] CaptioningThread: Building filter complex...")
-            filter_complex = self.build_filter_complex(
-                video_width, video_height, video_duration
-            )
-            print(f"[Debug] CaptioningThread: Filter complex built (length: {len(filter_complex)}).")
+            draw_filters = []
+            y_base = int(height * 0.66)  # bottom third start
+            for idx, w in enumerate(self.words):
+                word = w["word"].replace("'", "\u2019")  # avoid ffmpeg quote issues
+                start = float(w.get("start_time", w.get("start_offset", 0)))
+                end = float(w.get("end_time", w.get("end_offset", 0))) + 0.12  # hold word a bit longer
+                fontsize, size_key = self._word_fontsize(word, height)
 
-            # 3. Run ffmpeg
-            print("[Debug] CaptioningThread: Running ffmpeg...")
-            output_filename = self.run_ffmpeg(filter_complex)
-            print("[Debug] CaptioningThread: ffmpeg finished.")
+                # Shrink font if the word would exceed video width
+                try:
+                    max_width_px = width * 0.95  # small margin
+                    while True:
+                        font_obj = ImageFont.truetype(self.font_path, fontsize)
+                        bbox = font_obj.getbbox(word)
+                        text_width = bbox[2] - bbox[0]
+                        if text_width <= max_width_px or fontsize <= 10:
+                            break
+                        fontsize -= 1
+                except Exception:
+                    # If PIL can't load the font, continue with chosen size
+                    pass
 
-            self.finished_signal.emit(output_filename)
-            print("[Debug] CaptioningThread: Finished signal emitted.")
+                # y position – single line at bottom third (could be extended to multi-line)
+                y_pos = y_base
 
-        except Exception as e:
-            print("[Debug] CaptioningThread: EXCEPTION OCCURRED!")
-            traceback.print_exc() # Print the full traceback
-            error_message = str(e)
-            if isinstance(e, subprocess.CalledProcessError):
-                stderr_output = e.stderr.decode('utf-8', errors='ignore') if e.stderr else "No stderr output."
-                error_message += f"\n--- FFMPEG ERROR ---\n{stderr_output}"
-            self.error_signal.emit(error_message)
-
-    def get_video_info(self):
-        command = [
-            "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=s=x:p=0",
-            self.video_path,
-        ]
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        width, height = map(int, result.stdout.strip().split("x"))
-        return {"width": width, "height": height}
-
-    def get_video_duration(self):
-        command = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            self.video_path,
-        ]
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        return float(result.stdout.strip())
-
-    def build_filter_complex(self, video_width, video_height, video_duration):
-        print("[Debug] build_filter_complex: Starting.")
-        is_vertical = video_height > video_width
-
-        if is_vertical:
-            # Bottom half for shorts
-            box_width = int(video_width * 0.9)
-            box_height = int(video_height * 0.4)
-            x_pos = (video_width - box_width) // 2
-            y_pos = int(video_height * 0.55)
-        else:
-            # Left side for normal videos
-            box_width = int(video_width * 0.4)
-            box_height = int(video_height * 0.8)
-            x_pos = int(video_width * 0.05)
-            y_pos = (video_height - box_height) // 2
-
-        font_size = 60 # Base font size
-        space_width, _ = self.get_text_dimensions(" ", self.font_path, font_size)
-        drawtext_filters = []
-        line_buffer = []
-        x, y = 0, 0
-
-        # Helper to generate filters for a finished line
-        def flush_line_buffer(buffer, end_time):
-            if not buffer:
-                return []
-
-            filters = []
-
-            # ffmpeg's drawtext needs an escaped path for windows
-            escaped_font_path = self.font_path.replace('\\', '\\\\')
-            if platform.system() == "Windows":
-                escaped_font_path = escaped_font_path.replace(':', '\\:')
-
-            for word_info in buffer:
-                 # The comma in 'between' must be escaped!
-                 # Each word now appears at its own start time but disappears with the line
-                filters.append(
-                    f"drawtext=fontfile='{escaped_font_path}':text='{word_info['text']}':"
-                    f"fontsize={font_size}:fontcolor=white:"
-                    f"x={word_info['x']}:y={word_info['y']}:"
-                    f"enable='between(t,{word_info['start']}\\,{end_time})'"
+                fade = 0.15
+                alpha_expr = (
+                    f"if(lt(t,{start}),0,"  # before start => invisible
+                    f"if(lt(t,{start+fade}),(t-{start})/{fade},"  # fade-in
+                    f"if(lt(t,{end-fade}),1,"  # fully visible
+                    f"if(lt(t,{end}),({end}-t)/{fade},0))))"  # fade-out then invisible
                 )
-            return filters
 
-        print(f"[Debug] build_filter_complex: Starting loop over {len(self.transcription)} words.")
-        for i, word_data in enumerate(self.transcription):
-            word_text = word_data["word"].strip().replace("'", "’")
-            # This needs to be done carefully
-            word_text_escaped = re.sub(r"([\\:%',\.\[\];=])", r"\\\1", word_text)
+                draw = (
+                    f"drawtext=fontfile='{self.font_path}':"
+                    f"text='{word}':"
+                    f"fontcolor=white:alpha='{alpha_expr}':"
+                    f"fontsize={fontsize}:"
+                    f"x=(w-text_w)/2:y={y_pos}:"
+                    f"enable='between(t,{start},{end})'"
+                )
+                draw_filters.append(draw)
 
-            start_time = word_data["start"]
-
-            w, h = self.get_text_dimensions(word_text, self.font_path, font_size)
-
-            # --- Logic to decide when to break a line ---
-            break_condition = False
-
-            # If word overflows current line
-            if x > 0 and x + w > box_width:
-                y += h + 10
-                x = 0
-
-            # If line overflows the caption box, flush and reset
-            if y + h > box_height:
-                break_condition = True
-
-            # If there's a long pause, flush and reset
-            if i > 0 and start_time - self.transcription[i-1]['end'] > 2.0:
-                break_condition = True
-
-            if break_condition and line_buffer:
-                print(f"[Debug] build_filter_complex: Flushing line buffer at word index {i}")
-                line_end_time = line_buffer[-1]['end'] if line_buffer else start_time
-                drawtext_filters.extend(flush_line_buffer(line_buffer, line_end_time))
-
-                # Reset for the new screen of text
-                line_buffer = []
-                x, y = 0, 0
-
-            line_buffer.append({
-                "text": word_text_escaped,
-                "start": start_time,
-                "end": word_data["end"],
-                "x": x_pos + x,
-                "y": y_pos + y
-            })
-            x += w + space_width
-
-        # Flush any remaining words in the buffer at the end
-        if line_buffer:
-            print("[Debug] build_filter_complex: Flushing final line buffer.")
-            last_word_end = line_buffer[-1]['end']
-            line_end_time = min(last_word_end + 2.0, video_duration)
-            drawtext_filters.extend(flush_line_buffer(line_buffer, line_end_time))
-
-
-        if not drawtext_filters:
-            print("[Debug] build_filter_complex: No filters created.")
-            return "null"
-
-        joined_filters = ",".join(drawtext_filters)
-        print(f"[Debug] build_filter_complex: Finished, returning filter string of length {len(joined_filters)}.")
-        return joined_filters
-
-    def run_ffmpeg(self, filter_complex):
-        base, _ = os.path.splitext(os.path.basename(self.video_path))
-        output_dir = os.path.join("videos", "cuts")
-        output_filename = os.path.join(output_dir, f"{base}_captioned.mp4")
-
-        # The -filter_complex option must come before the -i input file.
-        # Note for Master: If this still fails with "Option not found",
-        # it's likely because your ffmpeg version (6.1+) was compiled
-        # without libharfbuzz, which is now required for drawtext.
-        command = [
-            "ffmpeg",
-            "-i", self.video_path,
-            "-vf", filter_complex, # Using -vf for video filter
-            "-c:a", "copy",
-            output_filename,
-            "-y"
-        ]
-
-        print("--- FFMPEG COMMAND ---")
-        # We join the command list into a single string for printing
-        print(" ".join(command))
-        print("----------------------")
-
-        try:
-            # Using shell=False is safer and handles arguments correctly.
-            subprocess.run(command, check=True, capture_output=True)
+            vf = ",".join(draw_filters)
+            cmd = [
+                "ffmpeg", "-y", "-i", self.video_path,
+                "-vf", vf,
+                "-codec:a", "copy",
+                self.output_path,
+            ]
+            subprocess.run(cmd, check=True)
+            self.finished.emit(True, "Captioning complete.")
         except subprocess.CalledProcessError as e:
-            # Re-raise with more context
-            stderr = e.stderr.decode('utf-8', errors='ignore') if e.stderr else "No stderr."
-            raise Exception(f"FFMPEG Error:\n{stderr}") from e
+            self.finished.emit(False, e.stderr or "ffmpeg error")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
 
-        return output_filename
 
+# -------------------------------------------------
+# UI – Caption Tab
+# -------------------------------------------------
 
 class CaptionTab(QWidget):
     def __init__(self):
         super().__init__()
-        self.asr_model = None
-        self.layout = QVBoxLayout(self)
+        _ensure_directories()
 
-        self.video_selector = QComboBox()
-        self.layout.addWidget(self.video_selector)
+        self.video_map: Dict[str, str] = {}
+        self.words: List[Dict] = []
 
-        self.transcribe_button = QPushButton("Transcribe Video")
-        self.layout.addWidget(self.transcribe_button)
+        main_layout = QVBoxLayout(self)
 
-        self.transcription_progress_bar = QProgressBar()
-        self.transcription_progress_bar.setRange(0, 0)  # Indeterminate
-        self.transcription_progress_bar.setVisible(False)
-        self.layout.addWidget(self.transcription_progress_bar)
+        # Video selection
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(QLabel("Select Clip:"))
+        self.video_combo = QComboBox()
+        video_layout.addWidget(self.video_combo)
+        main_layout.addLayout(video_layout)
 
-        self.transcription_table = QTableWidget()
-        self.transcription_table.setColumnCount(3)
-        self.transcription_table.setHorizontalHeaderLabels(
-            ["Word", "Start (s)", "End (s)"]
-        )
-        self.transcription_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.layout.addWidget(self.transcription_table)
+        # Font selection
+        font_layout = QHBoxLayout()
+        font_layout.addWidget(QLabel("Select Font:"))
+        self.font_combo = QComboBox()
+        font_layout.addWidget(self.font_combo)
+        main_layout.addLayout(font_layout)
 
-        captioning_layout = QHBoxLayout()
-        self.font_selector = QComboBox()
-        captioning_layout.addWidget(self.font_selector)
+        # Transcript table (shows word + timings)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Word", "Start", "End"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)  # type: ignore[attr-defined]
+        for col in (1, 2):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)  # type: ignore[attr-defined]
+        main_layout.addWidget(self.table)
 
-        self.caption_button = QPushButton("Generate Captioned Video")
-        captioning_layout.addWidget(self.caption_button)
-        self.layout.addLayout(captioning_layout)
+        # Buttons and progress
+        actions = QHBoxLayout()
+        self.transcribe_btn = QPushButton("Transcribe")
+        self.caption_btn = QPushButton("Create Captions")
+        self.caption_btn.setEnabled(False)
+        actions.addWidget(self.transcribe_btn)
+        actions.addWidget(self.caption_btn)
+        main_layout.addLayout(actions)
 
-        self.captioning_progress_bar = QProgressBar()
-        self.captioning_progress_bar.setRange(0, 0)
-        self.captioning_progress_bar.setVisible(False)
-        self.layout.addWidget(self.captioning_progress_bar)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        main_layout.addWidget(self.progress)
 
-        self.populate_videos()
-        self.populate_fonts()
+        # Connections
+        self.transcribe_btn.clicked.connect(self._start_transcription)
+        self.caption_btn.clicked.connect(self._start_captioning)
 
-        self.transcribe_button.clicked.connect(self.start_transcription)
-        self.caption_button.clicked.connect(self.start_captioning)
+        # Populate combos
+        self._populate_fonts()
+        self._populate_videos()
 
-    def populate_fonts(self):
-        self.font_selector.clear()
-        fonts_dir = "fonts"
-        if not os.path.exists(fonts_dir):
-            os.makedirs(fonts_dir)
+    # --------------------------------------------------
+    # Populate helpers
+    # --------------------------------------------------
+    def _populate_videos(self):
+        self.video_combo.blockSignals(True)
+        self.video_combo.clear()
+        if os.path.isdir(CLIPS_DIR):
+            videos = [os.path.join(CLIPS_DIR, f) for f in os.listdir(CLIPS_DIR) if f.lower().endswith((".mp4", ".mkv", ".avi", ".webm"))]
+            self.video_combo.addItems([os.path.basename(v) for v in videos])
+            self.video_map = {os.path.basename(v): v for v in videos}
+        self.video_combo.blockSignals(False)
 
-        font_paths = [
-            os.path.join(fonts_dir, f)
-            for f in os.listdir(fonts_dir)
-            if f.lower().endswith((".ttf", ".otf"))
-        ]
-        self.font_selector.addItems(font_paths)
-        if not font_paths:
-            self.font_selector.addItem("No fonts found in 'fonts' folder")
+    def _populate_fonts(self):
+        self.font_combo.clear()
+        fonts = _font_candidates()
+        for fpath in fonts:
+            self.font_combo.addItem(os.path.basename(fpath), userData=fpath)
 
-    def populate_videos(self):
-        self.video_selector.clear()
-        cuts_dir = os.path.join("videos", "cuts")
-        if not os.path.exists(cuts_dir):
-            os.makedirs(cuts_dir, exist_ok=True)
+    # --------------------------------------------------
+    # Transcription logic
+    # --------------------------------------------------
+    def _start_transcription(self):
+        name = self.video_combo.currentText()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Please select a clip.")
             return
+        path = self.video_map[name]
+        self.progress.setRange(0, 0)  # indefinite
+        self.transcribe_btn.setEnabled(False)
+        self.transcription_worker = TranscriptionThread(path)
+        self.transcription_worker.finished.connect(self._on_transcription_finished)
+        self.transcription_worker.error.connect(self._on_transcription_error)
+        self.transcription_worker.start()
 
-        videos = [
-            f
-            for f in os.listdir(cuts_dir)
-            if os.path.isfile(os.path.join(cuts_dir, f))
-        ]
-        self.video_selector.addItems(videos)
+    def _on_transcription_error(self, msg: str):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.transcribe_btn.setEnabled(True)
+        QMessageBox.critical(self, "Error", f"Transcription failed: {msg}")
 
-    def set_transcription(self, words):
-        self.transcription_table.setRowCount(len(words))
-        for i, word_data in enumerate(words):
-            word = QTableWidgetItem(word_data["word"])
-            start = QTableWidgetItem(f"{word_data['start']:.2f}")
-            end = QTableWidgetItem(f"{word_data['end']:.2f}")
+    def _on_transcription_finished(self, words: List[Dict]):
+        self.words = words
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.transcribe_btn.setEnabled(True)
+        self.caption_btn.setEnabled(True)
 
-            self.transcription_table.setItem(i, 0, word)
-            self.transcription_table.setItem(i, 1, start)
-            self.transcription_table.setItem(i, 2, end)
+        # Populate table
+        self.table.setRowCount(len(words))
+        for row, w in enumerate(words):
+            self.table.setItem(row, 0, QTableWidgetItem(w.get("word", "")))
 
-    def add_refresh_target(self, target):
-        pass
+            # NeMo 1.x uses 'start_time'/'end_time'; newer versions switched to 'start_offset'/'end_offset'.
+            s = w.get("start_time", w.get("start_offset", 0))
+            e = w.get("end_time", w.get("end_offset", 0))
 
-    def start_transcription(self):
-        if not self.asr_model:
-            # Show a message to the user that the model is loading
-            self.transcribe_button.setText("Loading Model...")
-            self.transcribe_button.setEnabled(False)
-            QApplication.processEvents()  # Update the UI
+            self.table.setItem(row, 1, QTableWidgetItem(f"{float(s):.2f}"))
+            self.table.setItem(row, 2, QTableWidgetItem(f"{float(e):.2f}"))
 
-            try:
-                self.asr_model = nemo_asr.models.ASRModel.from_pretrained(
-                    model_name="nvidia/parakeet-tdt-0.6b-v2"
-                )
-            except Exception as e:
-                self.on_transcription_error(f"Failed to load model: {e}")
-                self.transcribe_button.setText("Transcribe Video")
-                return
-            finally:
-                self.transcribe_button.setText("Transcribe Video")
-                self.transcribe_button.setEnabled(True)
-
-        video_name = self.video_selector.currentText()
-        if not video_name:
+    # --------------------------------------------------
+    # Captioning logic
+    # --------------------------------------------------
+    def _start_captioning(self):
+        if not self.words:
+            QMessageBox.warning(self, "Warning", "No transcription available.")
             return
+        name = self.video_combo.currentText()
+        video_path = self.video_map[name]
+        font_path = self.font_combo.currentData()
+        base, ext = os.path.splitext(name)
+        out_name = f"{base}_captioned{ext}"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
 
-        cuts_dir = os.path.join("videos", "cuts")
-        video_path = os.path.join(cuts_dir, video_name)
+        self.caption_btn.setEnabled(False)
+        self.progress.setRange(0, 0)
 
-        self.transcribe_button.setEnabled(False)
-        self.transcription_progress_bar.setVisible(True)
+        self.caption_worker = CaptioningThread(video_path, self.words, font_path, out_path)
+        self.caption_worker.finished.connect(self._on_captioning_finished)
+        self.caption_worker.start()
 
-        self.thread = TranscriptionThread(video_path, self.asr_model)
-        self.thread.finished_signal.connect(self.on_transcription_finished)
-        self.thread.error_signal.connect(self.on_transcription_error)
-        self.thread.start()
-
-    def on_transcription_finished(self, words):
-        self.set_transcription(words)
-        self.transcription_progress_bar.setVisible(False)
-        self.transcribe_button.setEnabled(True)
-
-    def on_transcription_error(self, error_message):
-        print(f"Error: {error_message}") # Should show a dialog later
-        self.transcription_progress_bar.setVisible(False)
-        self.transcribe_button.setEnabled(True)
-
-    def start_captioning(self):
-        video_name = self.video_selector.currentText()
-        font_path = self.font_selector.currentText()
-        if not video_name or not font_path:
-            return
-
-        # Get transcription data from the table
-        transcription = []
-        for row in range(self.transcription_table.rowCount()):
-            transcription.append({
-                "word": self.transcription_table.item(row, 0).text(),
-                "start": float(self.transcription_table.item(row, 1).text()),
-                "end": float(self.transcription_table.item(row, 2).text()),
-            })
-
-        if not transcription:
-            return # Don't run if there's no transcription
-
-        cuts_dir = os.path.join("videos", "cuts")
-        video_path = os.path.join(cuts_dir, video_name)
-
-        self.caption_button.setEnabled(False)
-        self.captioning_progress_bar.setVisible(True)
-
-        self.captioning_thread = CaptioningThread(video_path, font_path, transcription)
-        self.captioning_thread.finished_signal.connect(self.on_captioning_finished)
-        self.captioning_thread.error_signal.connect(self.on_captioning_error)
-        self.captioning_thread.start()
-
-    def on_captioning_finished(self, output_filename):
-        print(f"Video saved to {output_filename}")
-        self.captioning_progress_bar.setVisible(False)
-        self.caption_button.setEnabled(True)
-        self.populate_videos() # Refresh list
-
-    def on_captioning_error(self, error_message):
-        print(f"Captioning Error: {error_message}")
-        self.captioning_progress_bar.setVisible(False)
-        self.caption_button.setEnabled(True)
+    def _on_captioning_finished(self, success: bool, message: str):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.caption_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Success", message)
+        else:
+            QMessageBox.critical(self, "Error", message)
 
 
-def create_caption_tab():
+# Factory function for consistency with other tabs
+
+def create_caption_tab() -> QWidget:
     return CaptionTab()
