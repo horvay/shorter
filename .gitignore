@@ -2,3 +2,4 @@ videos
 .venv
 __pycache__
 temp/
+shorter.egg-info
