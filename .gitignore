@@ -3,3 +3,5 @@ videos
 __pycache__
 temp/
 shorter.egg-info
+credentials.json
+token.pickle
