@@ -1,168 +1,232 @@
 import os
-import pickle
-from typing import Optional
+import json
+import glob
+from typing import Optional, List, Dict
 
-from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit,
-    QTextEdit, QPushButton, QProgressBar, QMessageBox
-)
+# Suppress linter warnings for PySide6 imports
+# type: ignore[import-untyped]
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QComboBox,
+                            QLineEdit, QTextEdit, QLabel, QProgressBar,
+                            QMessageBox)
+# type: ignore[import-untyped]
+from PySide6.QtCore import Qt, QThread, Signal
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
 
-from googleapiclient.discovery import build  # type: ignore
-from googleapiclient.http import MediaFileUpload  # type: ignore
-from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
-from google.auth.transport.requests import Request  # type: ignore
+# Suppress linter warnings for googleapiclient dynamic attributes
+# type: ignore[import]
+# type: ignore[attr-defined]
 
-VIDEO_DIR = "videos"
-CUTS_DIR = os.path.join(VIDEO_DIR, "cuts")
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-CREDENTIALS_FILE = "credentials.json"  # user provides Google OAuth client here
-TOKEN_FILE = "token.pickle"
-
-
-def _get_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError("Google OAuth credentials.json not found.")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
-    return build("youtube", "v3", credentials=creds, cache_discovery=False)
-
-
-class UploadWorker(QThread):
+class UploadThread(QThread):
     progress = Signal(int)
-    finished = Signal(bool, str)
+    status = Signal(str)
+    finished = Signal(bool)
 
-    def __init__(self, video_path: str, title: str, description: str, privacy: str):
+    def __init__(self, youtube, video_file: str, title: str, description: str, privacy: str, playlist_id: Optional[str] = None):
         super().__init__()
-        self.video_path = video_path
+        self.youtube = youtube
+        self.video_file = video_file
         self.title = title
         self.description = description
         self.privacy = privacy
+        self.playlist_id = playlist_id
 
     def run(self):
         try:
-            service = _get_service()
-            request_body = {
-                "snippet": {
-                    "title": self.title,
-                    "description": self.description,
-                    "categoryId": "22",  # People & Blogs
+            self.status.emit("Starting upload...")
+            body = {
+                'snippet': {
+                    'title': self.title,
+                    'description': self.description,
+                    'tags': ['youtube', 'video'],
+                    'categoryId': '22'  # Category ID for People & Blogs
                 },
-                "status": {"privacyStatus": self.privacy},
+                'status': {
+                    'privacyStatus': self.privacy
+                }
             }
-            media = MediaFileUpload(self.video_path, chunksize=1024 * 1024, resumable=True)
-            request = service.videos().insert(part="snippet,status", body=request_body, media_body=media)
+
+            media = MediaFileUpload(self.video_file, chunksize=-1, resumable=True)
+            request = self.youtube.videos().insert(
+                part="snippet,status",
+                body=body,
+                media_body=media
+            )
+
             response = None
             while response is None:
                 status, response = request.next_chunk()
                 if status:
                     self.progress.emit(int(status.progress() * 100))
-            video_id = response.get("id")
-            self.progress.emit(100)
-            self.finished.emit(True, f"Upload complete! Video ID: {video_id}")
-        except Exception as e:
-            self.finished.emit(False, str(e))
+                    self.status.emit(f"Uploading: {int(status.progress() * 100)}%")
 
+            video_id = response['id']
+            self.status.emit("Video uploaded successfully!")
+
+            if self.playlist_id:
+                self.status.emit("Adding video to playlist...")
+                playlist_item_body = {
+                    'snippet': {
+                        'playlistId': self.playlist_id,
+                        'resourceId': {
+                            'kind': 'youtube#video',
+                            'videoId': video_id
+                        }
+                    }
+                }
+                self.youtube.playlistItems().insert(
+                    part="snippet",
+                    body=playlist_item_body
+                ).execute()
+                self.status.emit("Video added to playlist!")
+
+            self.finished.emit(True)
+        except Exception as e:
+            self.status.emit(f"Upload failed: {str(e)}")
+            self.finished.emit(False)
+
+class PublishTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.v_layout = QVBoxLayout(self)
+        self.youtube = None
+        self.playlists: List[Dict] = []
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.auth_button = QPushButton("Authenticate with YouTube")
+        self.auth_button.clicked.connect(self.authenticate)
+        self.v_layout.addWidget(self.auth_button)
+
+        self.video_label = QLabel("Select Video to Upload:")
+        self.v_layout.addWidget(self.video_label)
+
+        self.video_combo = QComboBox()
+        self.v_layout.addWidget(self.video_combo)
+
+        self.title_label = QLabel("Video Title:")
+        self.v_layout.addWidget(self.title_label)
+
+        self.title_input = QLineEdit()
+        self.v_layout.addWidget(self.title_input)
+
+        self.description_label = QLabel("Video Description:")
+        self.v_layout.addWidget(self.description_label)
+
+        self.description_input = QTextEdit()
+        self.v_layout.addWidget(self.description_input)
+
+        self.privacy_label = QLabel("Privacy Setting:")
+        self.v_layout.addWidget(self.privacy_label)
+
+        self.privacy_combo = QComboBox()
+        self.privacy_combo.addItems(["public", "private", "unlisted"])
+        self.v_layout.addWidget(self.privacy_combo)
+
+        self.playlist_label = QLabel("Add to Playlist (optional):")
+        self.v_layout.addWidget(self.playlist_label)
+
+        self.playlist_combo = QComboBox()
+        self.playlist_combo.addItem("None", None)
+        self.v_layout.addWidget(self.playlist_combo)
+
+        self.upload_button = QPushButton("Upload Video")
+        self.upload_button.clicked.connect(self.start_upload)
+        self.upload_button.setEnabled(False)
+        self.v_layout.addWidget(self.upload_button)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.v_layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("Status: Not authenticated")
+        self.v_layout.addWidget(self.status_label)
+
+    def refresh(self):
+        self.load_videos()
+        if self.youtube:
+            self.load_playlists()
+
+    def populate_videos(self):
+        """Alias used by MainWindow for cross-tab refresh system."""
+        self.load_videos()
+
+    def load_videos(self):
+        self.video_combo.clear()
+        captioned_folder = os.path.join("videos", "cuts", "captioned")
+        if not os.path.exists(captioned_folder):
+            os.makedirs(captioned_folder, exist_ok=True)
+        videos = glob.glob(os.path.join(captioned_folder, "*.mp4"))
+        for video in videos:
+            self.video_combo.addItem(os.path.basename(video), video)
+
+    def load_playlists(self):
+        if not self.youtube:
+            return
+        try:
+            self.playlist_combo.clear()
+            self.playlist_combo.addItem("None", None)
+            response = self.youtube.playlists().list(
+                part="snippet",
+                mine=True,
+                maxResults=50
+            ).execute()
+            self.playlists = response.get('items', [])
+            for playlist in self.playlists:
+                self.playlist_combo.addItem(playlist['snippet']['title'], playlist['id'])
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load playlists: {str(e)}")
+
+    def authenticate(self):
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json',
+                scopes=['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube']
+            )
+            credentials = flow.run_local_server(port=0)
+            self.youtube = build('youtube', 'v3', credentials=credentials)
+            self.auth_button.setEnabled(False)
+            self.upload_button.setEnabled(True)
+            self.status_label.setText("Status: Authenticated")
+            self.load_playlists()
+            QMessageBox.information(self, "Success", "Authentication successful!")
+        except FileNotFoundError:
+            QMessageBox.critical(self, "Error", "credentials.json file not found. Please ensure it is in the correct directory.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Authentication failed: {str(e)}")
+
+    def start_upload(self):
+        if self.video_combo.currentData() is None:
+            QMessageBox.warning(self, "Warning", "Please select a video to upload.")
+            return
+        if not self.title_input.text():
+            QMessageBox.warning(self, "Warning", "Please enter a title for the video.")
+            return
+
+        video_file = self.video_combo.currentData()
+        title = self.title_input.text()
+        description = self.description_input.toPlainText()
+        privacy = self.privacy_combo.currentText()
+        playlist_id = self.playlist_combo.currentData()
+
+        self.upload_thread = UploadThread(self.youtube, video_file, title, description, privacy, playlist_id)
+        self.upload_thread.progress.connect(self.progress_bar.setValue)
+        self.upload_thread.status.connect(self.status_label.setText)
+        self.upload_thread.finished.connect(self.upload_finished)
+        self.upload_thread.start()
+        self.upload_button.setEnabled(False)
+
+    def upload_finished(self, success: bool):
+        self.upload_button.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Success", "Video uploaded successfully!")
+        else:
+            QMessageBox.critical(self, "Error", "Video upload failed. Check the status for details.")
 
 def create_publish_tab() -> QWidget:
-    tab = QWidget()
-    layout = QVBoxLayout(tab)
-    tab.video_map = {}  # type: ignore[attr-defined]
-
-    # Video selection
-    vid_layout = QHBoxLayout()
-    vid_layout.addWidget(QLabel("Select Video:"))
-    video_combo = QComboBox()
-    vid_layout.addWidget(video_combo)
-    layout.addLayout(vid_layout)
-
-    # Title / Description
-    title_edit = QLineEdit()
-    title_edit.setPlaceholderText("Title")
-    desc_edit = QTextEdit()
-    desc_edit.setPlaceholderText("Description")
-    layout.addWidget(title_edit)
-    layout.addWidget(desc_edit)
-
-    # Privacy
-    priv_layout = QHBoxLayout()
-    priv_layout.addWidget(QLabel("Privacy:"))
-    privacy_combo = QComboBox()
-    privacy_combo.addItems(["public", "unlisted", "private"])
-    priv_layout.addWidget(privacy_combo)
-    layout.addLayout(priv_layout)
-
-    # Buttons
-    auth_button = QPushButton("Authenticate")
-    upload_button = QPushButton("Upload")
-    layout.addWidget(auth_button)
-    layout.addWidget(upload_button)
-
-    # Progress
-    progress = QProgressBar()
-    progress.setRange(0, 100)
-    layout.addWidget(progress)
-    layout.addStretch()
-
-    def authenticate():
-        try:
-            _get_service()
-            QMessageBox.information(tab, "Success", "Authentication successful.")
-        except Exception as e:
-            QMessageBox.critical(tab, "Error", str(e))
-
-    auth_button.clicked.connect(authenticate)
-
-    def start_upload():
-        vid_name = video_combo.currentText()
-        if not vid_name:
-            QMessageBox.warning(tab, "Warning", "Please select a video.")
-            return
-        full_path = tab.video_map[vid_name]  # type: ignore[attr-defined]
-        title = title_edit.text() or os.path.splitext(vid_name)[0]
-        description = desc_edit.toPlainText()
-        privacy = privacy_combo.currentText()
-
-        upload_button.setEnabled(False)
-        progress.setRange(0, 0)
-
-        tab.worker = UploadWorker(full_path, title, description, privacy)  # type: ignore[attr-defined]
-        tab.worker.progress.connect(progress.setValue)  # type: ignore[attr-defined]
-        tab.worker.finished.connect(on_finished)  # type: ignore[attr-defined]
-        tab.worker.start()  # type: ignore[attr-defined]
-
-    def on_finished(success: bool, message: str):
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        upload_button.setEnabled(True)
-        if success:
-            QMessageBox.information(tab, "Success", message)
-        else:
-            QMessageBox.critical(tab, "Error", message)
-
-    upload_button.clicked.connect(start_upload)
-
-    def populate_videos():
-        video_combo.blockSignals(True)
-        video_combo.clear()
-        vids = []
-        if os.path.exists(CUTS_DIR):
-            vids = [os.path.join(CUTS_DIR, f) for f in os.listdir(CUTS_DIR) if f.lower().endswith((".mp4", ".mkv", ".avi", ".webm"))]
-        video_combo.addItems([os.path.basename(v) for v in vids])
-        tab.video_map = {os.path.basename(v): v for v in vids}  # type: ignore[attr-defined]
-        video_combo.blockSignals(False)
-
-    tab.populate_videos = populate_videos  # type: ignore[attr-defined]
-    populate_videos()
-
+    """Factory function to maintain compatibility with main_window import."""
+    tab = PublishTab()
+    tab.refresh()
     return tab

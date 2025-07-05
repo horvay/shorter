@@ -1,19 +1,20 @@
 import sys
-from PySide6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QTabWidget,
-    QWidget,
-)
+import os
+
+# Suppress linter warnings for PySide6 imports
+# type: ignore[import-untyped]
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QTabWidget, QPushButton, QVBoxLayout
+# type: ignore[import-untyped]
+from PySide6.QtCore import Qt
 
 from shorter.ui.download_tab import create_download_tab
 from shorter.ui.select_section_tab import create_select_section_tab
 from shorter.ui.remove_silence_tab import create_remove_silence_tab
 from shorter.ui.remove_chunks_tab import create_remove_chunks_tab
+from shorter.ui.caption_tab import create_caption_tab
 from shorter.ui.zoom_tab import create_zoom_tab
 from shorter.ui.extras_tab import create_extras_tab
-from shorter.ui.caption_tab import create_caption_tab
-from shorter.ui.publish_tab import create_publish_tab
+from shorter.ui.publish_tab import PublishTab
 
 
 class MainWindow(QMainWindow):
@@ -34,7 +35,7 @@ class MainWindow(QMainWindow):
         self.zoom_tab = create_zoom_tab()
         self.extras_tab = create_extras_tab()
         self.caption_tab = create_caption_tab()
-        self.publish_tab = create_publish_tab()
+        self.publish_tab = PublishTab()
 
         self.tabs.addTab(self.download_tab, "1. Download")
         self.tabs.addTab(self.select_section_tab, "2. Select Section")
@@ -44,6 +45,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.caption_tab, "6. Caption")
         self.tabs.addTab(self.publish_tab, "7. Publish")
         self.tabs.addTab(self.extras_tab, "Extras")
+
+        # Ensure publish tab shows latest videos
+        if hasattr(self.publish_tab, "refresh"):
+            self.publish_tab.refresh()
 
         # Pass refresh functions
         self.download_tab.add_refresh_target(self.select_section_tab.populate_videos)  # type: ignore[attr-defined]
