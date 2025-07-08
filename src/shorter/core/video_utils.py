@@ -52,7 +52,7 @@ def cut_video(
         ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error cutting video: {e.stderr}")
@@ -144,7 +144,7 @@ def remove_silence(
     ]
 
     try:
-        subprocess.run(process_command, check=True, capture_output=True, text=True)
+        subprocess.run(process_command, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error removing silence: {e.stderr}")
@@ -195,7 +195,7 @@ def remove_chunks(
     ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error removing chunks: {e.stderr}")
@@ -265,7 +265,7 @@ def speed_up_video(
     ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error speeding up video: {e.stderr}")
@@ -346,7 +346,7 @@ def process_zoom_pan(
     ]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error processing zoom/pan: {e.stderr}")

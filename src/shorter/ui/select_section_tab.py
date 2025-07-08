@@ -140,13 +140,17 @@ def create_select_section_tab() -> QWidget:
             QMessageBox.warning(tab, "Warning", "Start time must be before end time.")
             return
 
-        success = cut_video(
-            in_path,
-            out_path,
-            format_time(int(start_time)),
-            format_time(int(end_time)),
-            vertical_checkbox.isChecked()
-        )
+        try:
+            success = cut_video(
+                in_path,
+                out_path,
+                format_time(int(start_time)),
+                format_time(int(end_time)),
+                vertical_checkbox.isChecked()
+            )
+        except FileNotFoundError:
+            QMessageBox.critical(tab, "Error", "ffmpeg executable not found. Please install ffmpeg and add it to your PATH.")
+            return
 
         if success:
             QMessageBox.information(tab, "Success", f"Video cut and saved to {out_path}")

@@ -142,7 +142,7 @@ class TranscriptionThread(QThread):
                 "ffmpeg", "-y", "-i", self.video_path, "-vn",
                 "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", wav_path,
             ]
-            subprocess.run(ff_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(ff_cmd, check=True)
 
             asr_out = self._model.transcribe([wav_path], timestamps=True)  # type: ignore[attr-defined]
             word_ts = asr_out[0].timestamp["word"]  # list of Dict(word,start_time/offset,...)
@@ -198,6 +198,9 @@ class CaptioningThread(QThread):
             info = _get_video_info(self.video_path)
             width, height = int(info["width"]), int(info["height"])
 
+            # FFmpeg filter graphs expect either forward slashes or double-backslashes in paths
+            font_ffmpeg_path = self.font_path.replace("\\", "/")
+
             draw_filters = []
             y_base = int(height * 0.66)  # bottom third start
             for idx, w in enumerate(self.words):
@@ -232,7 +235,7 @@ class CaptioningThread(QThread):
                 )
 
                 draw = (
-                    f"drawtext=fontfile='{self.font_path}':"
+                    f"drawtext=fontfile='{font_ffmpeg_path}':"
                     f"text='{word}':"
                     f"fontcolor=white:alpha='{alpha_expr}':"
                     f"fontsize={fontsize}:"
@@ -242,13 +245,67 @@ class CaptioningThread(QThread):
                 draw_filters.append(draw)
 
             vf = ",".join(draw_filters)
+            # write filter graph to a temporary file to avoid Windows command-line length limits
+            script_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+            script_file.write(vf)
+            script_file.close()
+            # Check if the source video has at least one audio stream
+            has_audio = False
+            try:
+                audio_probe = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "a",
+                        "-show_entries",
+                        "stream=index",
+                        "-of",
+                        "json",
+                        self.video_path,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                audio_streams = json.loads(audio_probe.stdout).get("streams", [])
+                has_audio = len(audio_streams) > 0
+            except Exception:
+                # If ffprobe fails, assume no audio to be safe
+                has_audio = False
+
             cmd = [
-                "ffmpeg", "-y", "-i", self.video_path,
-                "-vf", vf,
-                "-codec:a", "copy",
-                self.output_path,
+                "ffmpeg",
+                "-y",
+                "-i",
+                self.video_path,
+                # provide the external filter graph file to ffmpeg using the new file option syntax (ffmpeg ≥ 7)
+                "-/filter_complex",
+                script_file.name,
             ]
+
+            if has_audio:
+                # copy audio stream if present
+                cmd.extend(["-c:a", "copy"])
+            else:
+                # explicitly disable audio
+                cmd.append("-an")
+
+            # set a widely-supported video codec
+            cmd.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "23"])
+
+            cmd.append(self.output_path)
+
+            # Print the command for debugging purposes
+            print("FFmpeg command:", " ".join(cmd))
+
             subprocess.run(cmd, check=True)
+            # cleanup temporary filter script file
+            try:
+                os.remove(script_file.name)
+            except Exception:
+                pass
             self.finished.emit(True, "Captioning complete.")
         except subprocess.CalledProcessError as e:
             self.finished.emit(False, e.stderr or "ffmpeg error")
